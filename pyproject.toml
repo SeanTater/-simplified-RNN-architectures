@@ -1,0 +1,17 @@
+[project]
+name = "mingru"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26.3",
+    "torch>=2.5.0",
+    "tqdm>=4.64.1",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/rocm6.2"]

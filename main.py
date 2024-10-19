@@ -1,22 +1,34 @@
+#!/usr/bin/env python
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
 from tqdm import tqdm
+
 
 def g(x):
     return torch.where(x >= 0, x + 0.5, torch.sigmoid(x))
 
+
 def log_g(x):
     return torch.where(x >= 0, torch.log(F.relu(x) + 0.5), -F.softplus(-x))
 
+
 def parallel_scan_log(log_coeffs, log_values):
-    a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (1, 0))
-    log_h0_plus_b_star = torch.logcumsumexp(log_values - a_star.unsqueeze(-1), dim=1)
-    log_h = a_star.unsqueeze(-1) + log_h0_plus_b_star
+    # breakpoint()
+    a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (0, 0, 1, 0))
+    log_h0_plus_b_star = torch.logcumsumexp(log_values - a_star, dim=1)
+    log_h = a_star + log_h0_plus_b_star
     return torch.exp(log_h)
+
+def parallel_scan(coeffs, values):
+    a_star = F.pad(torch.cumsum(coeffs, dim=1), (0, 0, 1, 0))
+    log_h0_plus_b_star = torch.cumprod(values - a_star, dim=1)
+    log_h = a_star + log_h0_plus_b_star
+    return log_h
+
+
 class MinGRU(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(MinGRU, self).__init__()
@@ -27,10 +39,13 @@ class MinGRU(nn.Module):
         k = self.linear_z(x)
         log_z = -F.softplus(-k)
         log_coeffs = -F.softplus(k)
-        log_h_0 = log_g(h_0)
-        log_tilde_h = log_g(self.linear_h(x))
-        h = parallel_scan_log(log_coeffs, torch.cat([log_h_0, log_z + log_tilde_h], dim=1))
-        return h
+        h_0 = h_0.unsqueeze(1)
+        tilde_h = self.linear_h(x)
+        h = parallel_scan_log(
+            log_coeffs, torch.cat([h_0, log_z + tilde_h], dim=1)
+        )
+        return h[:, -x.size(1) :, :]
+
 
 class MinLSTM(nn.Module):
     def __init__(self, input_size, hidden_size):
@@ -48,41 +63,58 @@ class MinLSTM(nn.Module):
         h = parallel_scan_log(log_f, torch.cat([log_h_0, log_i + log_tilde_h], dim=1))
         return h
 
+
 class LanguageModel(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size, num_layers, rnn_type='minlstm'):
+    def __init__(
+        self, vocab_size, embed_size, hidden_size, num_layers, rnn_type, device, dtype
+    ):
         super(LanguageModel, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.embedding = nn.Embedding(
+            vocab_size, embed_size, device=device, dtype=dtype
+        )
         self.rnn_type = rnn_type
         self.rnn_layers = nn.ModuleList()
         for _ in range(num_layers):
-            if rnn_type == 'minlstm':
+            if rnn_type == "minlstm":
                 self.rnn_layers.append(MinLSTM(embed_size, hidden_size))
-            elif rnn_type == 'mingru':
+            elif rnn_type == "mingru":
                 self.rnn_layers.append(MinGRU(embed_size, hidden_size))
         self.fc = nn.Linear(hidden_size, vocab_size)
 
     def forward(self, x):
         x = self.embedding(x)
-        h = torch.zeros(x.size(0), x.size(2)).to(x.device)
+        h = torch.zeros(x.size(0), x.size(2)).to(x.device, torch.bfloat16)
         for rnn in self.rnn_layers:
             x = rnn(x, h)
         return self.fc(x)
 
+
 def load_shakespeare_data(file_path, seq_length=100):
-    with open(file_path, 'r') as f:
+    with open(file_path, "r") as f:
         text = f.read()
-    
+
     chars = sorted(list(set(text)))
     char_to_idx = {ch: i for i, ch in enumerate(chars)}
     idx_to_char = {i: ch for i, ch in enumerate(chars)}
-    
+
     data = [char_to_idx[ch] for ch in text]
     num_sequences = len(data) // seq_length
-    
-    X = torch.tensor([data[i:i+seq_length] for i in range(0, num_sequences*seq_length, seq_length)])
-    y = torch.tensor([data[i+1:i+seq_length+1] for i in range(0, num_sequences*seq_length, seq_length)])
-    
+
+    X = torch.tensor(
+        [
+            data[i : i + seq_length]
+            for i in range(0, num_sequences * seq_length, seq_length)
+        ]
+    )
+    y = torch.tensor(
+        [
+            data[i + 1 : i + seq_length + 1]
+            for i in range(0, num_sequences * seq_length, seq_length)
+        ]
+    )
+
     return X, y, char_to_idx, idx_to_char
+
 
 # Training function
 def train(model, train_loader, optimizer, criterion, device):
@@ -99,6 +131,7 @@ def train(model, train_loader, optimizer, criterion, device):
         total_loss += loss.item()
     return total_loss / len(train_loader)
 
+
 # Evaluation function
 def evaluate(model, val_loader, criterion, device):
     model.eval()
@@ -112,9 +145,11 @@ def evaluate(model, val_loader, criterion, device):
             total_loss += loss.item()
     return total_loss / len(val_loader)
 
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+    dtype = torch.bfloat16
+
     vocab_size = 65  # Assuming ASCII characters
     embed_size = 384
     hidden_size = 384
@@ -123,32 +158,48 @@ def main():
     lr = 1e-3
     epochs = 50
     seq_length = 100
-    
+
     # Load data
-    X, y, char_to_idx, idx_to_char = load_shakespeare_data("path_to_shakespeare_data.txt", seq_length)
+    X, y, char_to_idx, idx_to_char = load_shakespeare_data(
+        "data/tinyshakespeare.txt", seq_length
+    )
     dataset = TensorDataset(X, y)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size]
+    )
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
-    
-    model = LanguageModel(vocab_size, embed_size, hidden_size, num_layers, rnn_type='minlstm').to(device)
+
+    model = LanguageModel(
+        vocab_size,
+        embed_size,
+        hidden_size,
+        num_layers,
+        rnn_type="mingru",
+        device=device,
+        dtype=dtype,
+    ).to(device,dtype)
+    # model.compile()
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
-    
-    best_val_loss = float('inf')
+
+    best_val_loss = float("inf")
     for epoch in range(epochs):
         train_loss = train(model, train_loader, optimizer, criterion, device)
         val_loss = evaluate(model, val_loader, criterion, device)
-        
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-        
+
+        print(
+            f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
+        )
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), "best_model.pth")
-    
+
     print("Training completed.")
+
 
 if __name__ == "__main__":
     main()
