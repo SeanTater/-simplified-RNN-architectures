@@ -1,10 +1,69 @@
 #!/usr/bin/env python
+from pathlib import Path
+import io
+from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from transformers import GPT2Tokenizer
+from torch.amp import autocast
+from pydantic import BaseModel
+import tomllib
+from argparse import ArgumentParser
+from pydantic import Field, FilePath
+from datetime import datetime
+from torch.optim.lr_scheduler import LambdaLR
+
+
+# Load the GPT-2 tokenizer
+tokenizer: GPT2Tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+# Add a padding token if it doesn't exist
+if tokenizer.pad_token is None:
+    tokenizer.add_special_tokens({"pad_token": "<PAD>"})
+
+class ExperimentConfig(BaseModel):
+    name: str
+    description: str = ""
+    created_at: str = datetime.now().isoformat(timespec="seconds")
+
+class ModelConfig(BaseModel):
+    embed_size: int = Field(384 * 2, description="Size of the embedding layer")
+    hidden_size: int = Field(384 * 2, description="Size of the hidden layer")
+    num_layers: int = Field(3, description="Number of RNN layers")
+    rnn_type: Literal["mingru", "minlstm"] = Field(
+        "mingru", description="Type of RNN to use: 'mingru' or 'minlstm'"
+    )
+    dropout: float = Field(0.25, description="Dropout rate for the model")
+
+
+class TrainConfig(BaseModel):
+    learning_rate: float = Field(1e-3, description="Learning rate for the optimizer")
+    epochs: int = Field(50, description="Number of training epochs")
+
+
+class DatasetConfig(BaseModel):
+    file_path: FilePath = Field(..., description="Path to the dataset file")
+    batch_size: int = Field(64, description="Batch size for training")
+    seq_length: int = Field(100, description="Sequence length for training")
+    byte_snippet_length: int = Field(
+        2048, description="Length of byte snippets to read from the file"
+    )
+    cut_to: int = Field(1000, description="Cut the dataset to this many byte snippets")
+
+
+class Config(BaseModel):
+    model: ModelConfig
+    train: TrainConfig
+    dataset: DatasetConfig
+    experiment: ExperimentConfig
+
+    @staticmethod
+    def from_file(path: Path):
+        return Config.model_validate(tomllib.loads(path.read_text()))
 
 
 def g(x):
@@ -16,17 +75,10 @@ def log_g(x):
 
 
 def parallel_scan_log(log_coeffs, log_values):
-    # breakpoint()
     a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (0, 0, 1, 0))
     log_h0_plus_b_star = torch.logcumsumexp(log_values - a_star, dim=1)
     log_h = a_star + log_h0_plus_b_star
     return torch.exp(log_h)
-
-def parallel_scan(coeffs, values):
-    a_star = F.pad(torch.cumsum(coeffs, dim=1), (0, 0, 1, 0))
-    log_h0_plus_b_star = torch.cumprod(values - a_star, dim=1)
-    log_h = a_star + log_h0_plus_b_star
-    return log_h
 
 
 class MinGRU(nn.Module):
@@ -39,10 +91,10 @@ class MinGRU(nn.Module):
         k = self.linear_z(x)
         log_z = -F.softplus(-k)
         log_coeffs = -F.softplus(k)
-        h_0 = h_0.unsqueeze(1)
-        tilde_h = self.linear_h(x)
+        log_h_0 = log_g(h_0).unsqueeze(1)
+        log_tilde_h = log_g(self.linear_h(x))
         h = parallel_scan_log(
-            log_coeffs, torch.cat([h_0, log_z + tilde_h], dim=1)
+            log_coeffs, torch.cat([log_h_0, log_z + log_tilde_h], dim=1)
         )
         return h[:, -x.size(1) :, :]
 
@@ -65,140 +117,237 @@ class MinLSTM(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    def __init__(
-        self, vocab_size, embed_size, hidden_size, num_layers, rnn_type, device, dtype
-    ):
+    config: ModelConfig
+    embedding: nn.Embedding
+    rnn_type: Literal["mingru", "minlstm"]
+    rnn_layers: nn.ModuleList
+    layer_norm: nn.LayerNorm
+    dropout: nn.Dropout
+    fc: nn.Linear
+
+    def __init__(self, config: ModelConfig, vocab_size: int):
         super(LanguageModel, self).__init__()
+        self.config = config
         self.embedding = nn.Embedding(
-            vocab_size, embed_size, device=device, dtype=dtype
+            vocab_size, config.embed_size, padding_idx=tokenizer.pad_token_id
         )
-        self.rnn_type = rnn_type
+        self.rnn_type = config.rnn_type
         self.rnn_layers = nn.ModuleList()
-        for _ in range(num_layers):
-            if rnn_type == "minlstm":
-                self.rnn_layers.append(MinLSTM(embed_size, hidden_size))
-            elif rnn_type == "mingru":
-                self.rnn_layers.append(MinGRU(embed_size, hidden_size))
-        self.fc = nn.Linear(hidden_size, vocab_size)
+        self.layer_norm = nn.LayerNorm(config.embed_size)
+        self.dropout = nn.Dropout(config.dropout)
+        for _ in range(config.num_layers):
+            if config.rnn_type == "minlstm":
+                self.rnn_layers.append(MinLSTM(config.embed_size, config.hidden_size))
+            elif config.rnn_type == "mingru":
+                self.rnn_layers.append(MinGRU(config.embed_size, config.hidden_size))
+        self.fc = nn.Linear(config.hidden_size, vocab_size)
 
     def forward(self, x):
         x = self.embedding(x)
-        h = torch.zeros(x.size(0), x.size(2)).to(x.device, torch.bfloat16)
+        h = torch.zeros(x.size(0), x.size(2)).to(x.device)
         for rnn in self.rnn_layers:
             x = rnn(x, h)
+            x = self.layer_norm(x)
+            x = self.dropout(x)
         return self.fc(x)
 
 
-def load_shakespeare_data(file_path, seq_length=100):
-    with open(file_path, "r") as f:
-        text = f.read()
+class SinglefileDataset(Dataset):
+    open_file: io.TextIOWrapper
+    config: DatasetConfig
 
-    chars = sorted(list(set(text)))
-    char_to_idx = {ch: i for i, ch in enumerate(chars)}
-    idx_to_char = {i: ch for i, ch in enumerate(chars)}
+    def __init__(self, config: DatasetConfig):
+        self.config = config
+        self.open_file = config.file_path.open("rt")
 
-    data = [char_to_idx[ch] for ch in text]
-    num_sequences = len(data) // seq_length
+    def __len__(self):
+        actual_len = (
+            self.config.file_path.stat().st_size // self.config.byte_snippet_length
+        )
+        return min(self.config.cut_to, actual_len)
 
-    X = torch.tensor(
-        [
-            data[i : i + seq_length]
-            for i in range(0, num_sequences * seq_length, seq_length)
-        ]
-    )
-    y = torch.tensor(
-        [
-            data[i + 1 : i + seq_length + 1]
-            for i in range(0, num_sequences * seq_length, seq_length)
-        ]
-    )
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        self.open_file.seek(idx * self.config.byte_snippet_length)
+        while True:
+            try:
+                # Skip to the next valid unicode character
+                self.open_file.read(1)
+                break
+            except UnicodeDecodeError:
+                continue
 
-    return X, y, char_to_idx, idx_to_char
+        snippet = self.open_file.read(self.config.byte_snippet_length)
+
+        # Tokenize the text
+        tokens = tokenizer.encode(
+            snippet, add_special_tokens=False, padding="max_length", max_length=1024
+        )
+
+        # Calculate the number of sequences
+        # num_sequences = (len(tokens) - 1) // self.byte_snippet_length
+
+        # Truncate the token list to fit the sequences
+        # tokens = tokens[: num_sequences * self.byte_snippet_length + 1]
+
+        # Create input and target sequences
+        input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
+        target_ids = torch.tensor(tokens[1:], dtype=torch.long)
+
+        # Unfold into sliding context windows
+        X = input_ids.unfold(0, self.config.seq_length, 1)[:self.config.batch_size, :]
+        Y = target_ids.unfold(0, self.config.seq_length, 1)[:self.config.batch_size, :]
+
+        return X, Y
 
 
-# Training function
-def train(model, train_loader, optimizer, criterion, device):
-    model.train()
-    total_loss = 0
-    for batch in tqdm(train_loader, desc="Training"):
-        x, y = batch
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-        output = model(x)
-        loss = criterion(output.view(-1, output.size(-1)), y.view(-1))
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    return total_loss / len(train_loader)
+class Trainer:
+    model: LanguageModel
+    config: TrainConfig
+    optimizer: optim.Optimizer
+    scaler: torch.GradScaler = torch.GradScaler()
+    scheduler: LambdaLR
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
 
+    def __init__(self, config: TrainConfig, model: LanguageModel):
+        self.model = model.to(self.device)
+        self.model.compile()
+        self.optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, fused=True)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
-# Evaluation function
-def evaluate(model, val_loader, criterion, device):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Evaluating"):
-            x, y = batch
-            x, y = x.to(device), y.to(device)
-            output = model(x)
-            loss = criterion(output.view(-1, output.size(-1)), y.view(-1))
-            total_loss += loss.item()
-    return total_loss / len(val_loader)
+        # Learning rate scheduler
+        start_end_periods = config.epochs // 10
+        warmup_rates = torch.linspace(0.01, 1, start_end_periods)
+        middle_rates = torch.ones(config.epochs - start_end_periods * 2)
+        cooldown_rates = torch.linspace(1, 0.01, start_end_periods + 1)
+        rates = torch.cat([warmup_rates, middle_rates, cooldown_rates])
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda=lambda epoch: rates[epoch])
+
+    def train(self, train_loader):
+        with autocast(device_type=self.device.type):
+            self.model.train()
+            total_loss = 0
+            progressbar = tqdm(train_loader, desc="Training")
+            for i, batch in enumerate(progressbar):
+                x, y = batch
+                x, y = x.to(self.device), y.to(self.device)
+                self.optimizer.zero_grad()
+                output = self.model(x)
+                loss = self.criterion(output.view(-1, output.size(-1)), y.reshape(-1))
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1e-6)
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                total_loss += loss.item()
+                progressbar.set_postfix({"loss": f"{total_loss / (i+1):.04f}"})
+
+            self.scheduler.step()
+        return total_loss / len(train_loader)
+
+    def evaluate(self, val_loader):
+        with autocast(device_type=self.device.type):
+            self.model.eval()
+            total_loss = 0
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc="Evaluating"):
+                    x, y = batch
+                    x, y = x.to(self.device), y.to(self.device)
+                    output = self.model(x)
+                    loss = self.criterion(output.view(-1, output.size(-1)), y.reshape(-1))
+                    total_loss += loss.item()
+        return total_loss / len(val_loader)
+    
+    def save_model(self, path):
+        torch.save(self.model.state_dict(), path)
+
+class Chat:
+    """ Continue a string of text using the trained model """
+    model: LanguageModel
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __init__(self, model: LanguageModel):
+        self.model = model
+        self.model.to(self.device)
+       
+    @staticmethod
+    def from_path(model_path: Path):
+        model = LanguageModel(ModelConfig(), vocab_size=tokenizer.total_vocab_size)
+        model.load_state_dict(torch.load(model_path.open("rb"), weights_only=True))
+    
+        return Chat(model)
+    
+    def chat(self, text: str, max_length: int = 100) -> str:
+        self.model.eval()
+        with torch.no_grad():
+            tokens = tokenizer.encode(text, add_special_tokens=False, return_tensors="pt")
+            tokens = tokens.to(self.device)
+            for _ in range(max_length):
+                output = self.model(tokens)
+                next_token = torch.argmax(output[:, -1, :], dim=-1).unsqueeze(1)
+                tokens = torch.cat([tokens, next_token], dim=1)
+                if next_token == tokenizer.eos_token_id:
+                    break
+            return tokenizer.decode(tokens[0], skip_special_tokens=True)
+    
+    def repl(self):
+        while True:
+            text = input("You: ")
+            if text == "exit" or not text:
+                break
+            response = self.chat(text)
+            print("Bot:", response)
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16
+    parser = ArgumentParser(description="Train a MinGRU model on a single text file")
+    parser.add_argument("config_file", type=str, help="Path to the configuration TOML")
+    args = parser.parse_args()
 
-    vocab_size = 65  # Assuming ASCII characters
-    embed_size = 384
-    hidden_size = 384
-    num_layers = 3
-    batch_size = 64
-    lr = 1e-3
-    epochs = 50
-    seq_length = 100
+    config = Config.from_file(Path(args.config_file))
 
-    # Load data
-    X, y, char_to_idx, idx_to_char = load_shakespeare_data(
-        "data/tinyshakespeare.txt", seq_length
-    )
-    dataset = TensorDataset(X, y)
+    vocab_size = tokenizer.total_vocab_size
+
+    dataset = SinglefileDataset(config.dataset)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(
         dataset, [train_size, val_size]
     )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    train_loader = DataLoader(train_dataset, shuffle=True, batch_size=None)
+    val_loader = DataLoader(val_dataset, batch_size=None)
 
-    model = LanguageModel(
-        vocab_size,
-        embed_size,
-        hidden_size,
-        num_layers,
-        rnn_type="mingru",
-        device=device,
-        dtype=dtype,
-    ).to(device,dtype)
-    # model.compile()
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+    model = LanguageModel(config.model, vocab_size=vocab_size)
+    trainer = Trainer(config.train, model)
 
     best_val_loss = float("inf")
-    for epoch in range(epochs):
-        train_loss = train(model, train_loader, optimizer, criterion, device)
-        val_loss = evaluate(model, val_loader, criterion, device)
-
+    last_model_path: Path | None = None
+    for epoch in range(config.train.epochs):
+        train_loss = trainer.train(
+            train_loader
+        )
+        val_loss = trainer.evaluate(val_loader)
         print(
-            f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
+            f"Epoch {epoch+1}/{config.train.epochs}, Train Loss: {train_loss:.04f}, Val Loss: {val_loss:.04f}, LR: {trainer.scheduler.get_last_lr()[0]:.06f}"
         )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), "best_model.pth")
+            # Remove the old model
+            if last_model_path is not None:
+                last_model_path.unlink()
+            last_model_path = Path(f"data/models/{config.experiment.name}-{config.experiment.created_at}-ce{best_val_loss:.03f}.pth")
+            trainer.save_model(last_model_path)
+            bot = Chat(model)
+            # Print some examples of the bot's responses
+            print(f"Lizards are {bot.chat('lizards are', max_length=10)}")
+            print(f"Python is {bot.chat('python is', max_length=10)}")
+            print(f"Hello, {bot.chat('hello', max_length=10)}")
 
     print("Training completed.")
+    if last_model_path is not None:
+        print("Best model saved at", last_model_path)
+        Chat.from_path(last_model_path).repl()
 
 
 if __name__ == "__main__":
