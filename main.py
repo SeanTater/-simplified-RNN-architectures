@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 from pathlib import Path
-import io
 from typing import Literal
 import torch
 import torch.nn as nn
@@ -10,13 +9,10 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import GPT2Tokenizer
 from torch.amp import autocast
-from pydantic import BaseModel
-import tomllib
 from argparse import ArgumentParser
-from pydantic import Field, FilePath
-from datetime import datetime
 from torch.optim.lr_scheduler import LambdaLR
-
+import polars as pl
+from pydantic_models import ModelConfig, TrainConfig, DatasetConfig, Config
 
 # Load the GPT-2 tokenizer
 tokenizer: GPT2Tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -24,46 +20,6 @@ tokenizer: GPT2Tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 # Add a padding token if it doesn't exist
 if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({"pad_token": "<PAD>"})
-
-class ExperimentConfig(BaseModel):
-    name: str
-    description: str = ""
-    created_at: str = datetime.now().isoformat(timespec="seconds")
-
-class ModelConfig(BaseModel):
-    embed_size: int = Field(384 * 2, description="Size of the embedding layer")
-    hidden_size: int = Field(384 * 2, description="Size of the hidden layer")
-    num_layers: int = Field(3, description="Number of RNN layers")
-    rnn_type: Literal["mingru", "minlstm"] = Field(
-        "mingru", description="Type of RNN to use: 'mingru' or 'minlstm'"
-    )
-    dropout: float = Field(0.25, description="Dropout rate for the model")
-
-
-class TrainConfig(BaseModel):
-    learning_rate: float = Field(1e-3, description="Learning rate for the optimizer")
-    epochs: int = Field(50, description="Number of training epochs")
-
-
-class DatasetConfig(BaseModel):
-    file_path: FilePath = Field(..., description="Path to the dataset file")
-    batch_size: int = Field(64, description="Batch size for training")
-    seq_length: int = Field(100, description="Sequence length for training")
-    byte_snippet_length: int = Field(
-        2048, description="Length of byte snippets to read from the file"
-    )
-    cut_to: int = Field(1000, description="Cut the dataset to this many byte snippets")
-
-
-class Config(BaseModel):
-    model: ModelConfig
-    train: TrainConfig
-    dataset: DatasetConfig
-    experiment: ExperimentConfig
-
-    @staticmethod
-    def from_file(path: Path):
-        return Config.model_validate(tomllib.loads(path.read_text()))
 
 
 def g(x):
@@ -125,7 +81,7 @@ class LanguageModel(nn.Module):
     dropout: nn.Dropout
     fc: nn.Linear
 
-    def __init__(self, config: ModelConfig, vocab_size: int):
+    def __init__(self, config: ModelConfig, vocab_size: int, seq_length: int = 100):
         super(LanguageModel, self).__init__()
         self.config = config
         self.embedding = nn.Embedding(
@@ -145,7 +101,33 @@ class LanguageModel(nn.Module):
     def forward(self, x):
         x = self.embedding(x)
         h = torch.zeros(x.size(0), x.size(2)).to(x.device)
-        for rnn in self.rnn_layers:
+        for i, rnn in enumerate(self.rnn_layers):
+            # Experiment: After the first layer, use dilated convolutions to increase the receptive field
+            # Result: This is far, far too slow
+            # if i > 1:
+            #     x = self.convolution(x.permute(0, 2, 1)).permute(0, 2, 1)
+            #     # Each convolution should only be backward looking
+            #     x = x[:, :-self.config.dilation, :]
+            #     # Now we need to pad the sequence to the right
+            #     x = F.pad(x, (0, 0, 0, self.config.dilation, 0, 0))
+
+            # Experiment: After the first layer, use mean pooling to increase the receptive field
+            # Result: this is fast but we can only look back 1 token, we want to look exponentially back with each layer
+            # if i > 1:
+            #     # Instead of using dilated convolutions, use mean pooling to increase the receptive field
+            #     x = F.avg_pool1d(x.permute(0, 2, 1), kernel_size=2, stride=1, padding=1).permute(0, 2, 1)
+            #     # Each pooling operation should only be backward looking
+            #     x = x[:, :-1, :]
+            #     # It was already padded, we don't pad it again
+
+            # Experiment: After the first layer, unfold, mean pool, and fold to increase the receptive field from way back
+            # if i > 1:
+            #     # Unfold the sequence, which introduces the dilation too
+            #     x = x.unfold(dim=1, size=2, step=self.config.dilation)
+            #     # Mean pool the sequence
+            #     x = F.avg_pool1d(x.permute(0, 2, 1), kernel_size=2, stride=1, padding=1).permute(0, 2, 1)
+            #     # Fold the sequence back
+            #     x = self.fold(x.permute(0, 2, 1)).permute(0, 2, 1)
             x = rnn(x, h)
             x = self.layer_norm(x)
             x = self.dropout(x)
@@ -153,49 +135,47 @@ class LanguageModel(nn.Module):
 
 
 class SinglefileDataset(Dataset):
-    open_file: io.TextIOWrapper
+    frame: pl.DataFrame
     config: DatasetConfig
 
     def __init__(self, config: DatasetConfig):
         self.config = config
-        self.open_file = config.file_path.open("rt")
+        self.frame = pl.read_parquet(config.file_path)
 
     def __len__(self):
-        actual_len = (
-            self.config.file_path.stat().st_size // self.config.byte_snippet_length
-        )
-        return min(self.config.cut_to, actual_len)
+        return min(self.config.cut_to, self.frame.height)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        self.open_file.seek(idx * self.config.byte_snippet_length)
-        while True:
-            try:
-                # Skip to the next valid unicode character
-                self.open_file.read(1)
-                break
-            except UnicodeDecodeError:
-                continue
-
-        snippet = self.open_file.read(self.config.byte_snippet_length)
+        snippet = self.frame["markdown"][idx]
 
         # Tokenize the text
         tokens = tokenizer.encode(
             snippet, add_special_tokens=False, padding="max_length", max_length=1024
         )
 
-        # Calculate the number of sequences
-        # num_sequences = (len(tokens) - 1) // self.byte_snippet_length
-
-        # Truncate the token list to fit the sequences
-        # tokens = tokens[: num_sequences * self.byte_snippet_length + 1]
-
         # Create input and target sequences
         input_ids = torch.tensor(tokens[:-1], dtype=torch.long)
         target_ids = torch.tensor(tokens[1:], dtype=torch.long)
 
+        # Pad both ends with one less than the sequence length
+        pad_length = self.config.seq_length - 1
+        input_ids = F.pad(
+            input_ids, (pad_length, pad_length), value=tokenizer.pad_token_id
+        )
+        target_ids = F.pad(
+            target_ids, (pad_length, pad_length), value=tokenizer.pad_token_id
+        )
+
+        # Work out a sliding window step that spans most of the sequence
+        step = max(1, len(input_ids) // self.config.batch_size)
+
         # Unfold into sliding context windows
-        X = input_ids.unfold(0, self.config.seq_length, 1)[:self.config.batch_size, :]
-        Y = target_ids.unfold(0, self.config.seq_length, 1)[:self.config.batch_size, :]
+        X = input_ids.unfold(0, self.config.seq_length, step)[
+            : self.config.batch_size, :
+        ]
+        Y = target_ids.unfold(0, self.config.seq_length, step)[
+            : self.config.batch_size, :
+        ]
 
         return X, Y
 
@@ -207,12 +187,13 @@ class Trainer:
     scaler: torch.GradScaler = torch.GradScaler()
     scheduler: LambdaLR
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
 
     def __init__(self, config: TrainConfig, model: LanguageModel):
         self.model = model.to(self.device)
         self.model.compile()
-        self.optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, fused=True)
+        self.optimizer = optim.AdamW(
+            model.parameters(), lr=config.learning_rate, fused=True
+        )
         self.criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
         # Learning rate scheduler
@@ -237,7 +218,7 @@ class Trainer:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1e-6)
-                
+
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 total_loss += loss.item()
@@ -255,32 +236,39 @@ class Trainer:
                     x, y = batch
                     x, y = x.to(self.device), y.to(self.device)
                     output = self.model(x)
-                    loss = self.criterion(output.view(-1, output.size(-1)), y.reshape(-1))
+                    loss = self.criterion(
+                        output.view(-1, output.size(-1)), y.reshape(-1)
+                    )
                     total_loss += loss.item()
         return total_loss / len(val_loader)
-    
+
     def save_model(self, path):
         torch.save(self.model.state_dict(), path)
 
+
 class Chat:
-    """ Continue a string of text using the trained model """
+    """Continue a string of text using the trained model"""
+
     model: LanguageModel
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     def __init__(self, model: LanguageModel):
         self.model = model
         self.model.to(self.device)
-       
+
     @staticmethod
     def from_path(model_path: Path):
         model = LanguageModel(ModelConfig(), vocab_size=tokenizer.total_vocab_size)
         model.load_state_dict(torch.load(model_path.open("rb"), weights_only=True))
-    
+
         return Chat(model)
-    
+
     def chat(self, text: str, max_length: int = 100) -> str:
         self.model.eval()
         with torch.no_grad():
-            tokens = tokenizer.encode(text, add_special_tokens=False, return_tensors="pt")
+            tokens = tokenizer.encode(
+                text, add_special_tokens=False, return_tensors="pt"
+            )
             tokens = tokens.to(self.device)
             for _ in range(max_length):
                 output = self.model(tokens)
@@ -289,7 +277,7 @@ class Chat:
                 if next_token == tokenizer.eos_token_id:
                     break
             return tokenizer.decode(tokens[0], skip_special_tokens=True)
-    
+
     def repl(self):
         while True:
             text = input("You: ")
@@ -323,9 +311,7 @@ def main():
     best_val_loss = float("inf")
     last_model_path: Path | None = None
     for epoch in range(config.train.epochs):
-        train_loss = trainer.train(
-            train_loader
-        )
+        train_loss = trainer.train(train_loader)
         val_loss = trainer.evaluate(val_loader)
         print(
             f"Epoch {epoch+1}/{config.train.epochs}, Train Loss: {train_loss:.04f}, Val Loss: {val_loss:.04f}, LR: {trainer.scheduler.get_last_lr()[0]:.06f}"
@@ -336,7 +322,9 @@ def main():
             # Remove the old model
             if last_model_path is not None:
                 last_model_path.unlink()
-            last_model_path = Path(f"data/models/{config.experiment.name}-{config.experiment.created_at}-ce{best_val_loss:.03f}.pth")
+            last_model_path = Path(
+                f"data/models/{config.experiment.name}-{config.experiment.created_at}-ce{best_val_loss:.03f}.pth"
+            )
             trainer.save_model(last_model_path)
             bot = Chat(model)
             # Print some examples of the bot's responses

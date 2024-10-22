@@ -113,6 +113,7 @@ dependencies = [
     { name = "polars" },
     { name = "pydantic", version = "2.7.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
     { name = "pydantic", version = "2.9.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
+    { name = "tomlkit" },
     { name = "torch" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -123,6 +124,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.26.3" },
     { name = "polars", specifier = ">=1.9.0" },
     { name = "pydantic", specifier = ">=2.7.4" },
+    { name = "tomlkit", specifier = ">=0.13.2" },
     { name = "torch", specifier = ">=2.5.0", index = "pytorch" },
     { name = "tqdm", specifier = ">=4.64.1" },
     { name = "transformers", specifier = ">=4.45.2" },
@@ -435,6 +437,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/bb/37/eaa072b848471d31ae3df6e6d5be5ae594ed5fe39ca921e65cabf193dbde/tokenizers-0.20.1-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:3ea919687aa7001a8ff1ba36ac64f165c4e89035f57998fa6cedcfd877be619d", size = 9304427 },
     { url = "https://files.pythonhosted.org/packages/41/ff/4aeb924d09f6561209b57af9123a0a28fa69472cc71ee40415f036253203/tokenizers-0.20.1-cp312-none-win32.whl", hash = "sha256:6d3ac5c1f48358ffe20086bf065e843c0d0a9fce0d7f0f45d5f2f9fba3609ca5", size = 2195986 },
     { url = "https://files.pythonhosted.org/packages/7e/ba/18bf6a7ad04f8225b71aa862b57188748d1d81e268de4a9aac1aed237246/tokenizers-0.20.1-cp312-none-win_amd64.whl", hash = "sha256:b0874481aea54a178f2bccc45aa2d0c99cd3f79143a0948af6a9a21dcc49173b", size = 2377984 },
+]
+
+[[package]]
+name = "tomlkit"
+version = "0.13.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b1/09/a439bec5888f00a54b8b9f05fa94d7f901d6735ef4e55dcec9bc37b5d8fa/tomlkit-0.13.2.tar.gz", hash = "sha256:fff5fe59a87295b278abd31bec92c15d9bc4a06885ab12bcea52c71119392e79", size = 192885 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f9/b6/a447b5e4ec71e13871be01ba81f5dfc9d0af7e473da256ff46bc0e24026f/tomlkit-0.13.2-py3-none-any.whl", hash = "sha256:7a974427f6e119197f670fbbbeae7bef749a6c14e793db934baefc1b5f03efde", size = 37955 },
 ]
 
 [[package]]
