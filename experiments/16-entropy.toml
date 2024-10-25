@@ -1,11 +1,13 @@
 [experiment]
-name = "12-larger-batch"
+name = "16-entropy"
+
 [model]
 embed_size = 768
 hidden_size = 768
 num_layers = 3
 rnn_type = "mingru"
 dropout = 0.25
+entropy_weight = 0.01
 
 [train]
 learning_rate = 3e-4
@@ -17,4 +19,4 @@ file_path = "data/09_04_2023_v1.parquet"
 byte_snippet_length = 2048
 seq_length = 32
 batch_size = 64
-cut_to = 3200
+cut_to = 12800

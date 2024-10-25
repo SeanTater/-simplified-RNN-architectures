@@ -1,5 +1,6 @@
 [experiment]
-name = "12-larger-batch"
+name = "15-groups-smaller"
+
 [model]
 embed_size = 768
 hidden_size = 768
@@ -17,4 +18,4 @@ file_path = "data/09_04_2023_v1.parquet"
 byte_snippet_length = 2048
 seq_length = 32
 batch_size = 64
-cut_to = 3200
+cut_to = 12800

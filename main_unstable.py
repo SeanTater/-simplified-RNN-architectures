@@ -56,38 +56,49 @@ class MinGRU(nn.Module):
         h = parallel_scan_log(
             log_coeffs, torch.cat([log_h_0, log_z + log_tilde_h], dim=1)
         )
-        return h[:, -x.size(1) :, :]
+        return h[:, -x.size(1) :, :], 0
 
 class GroupedMinGRU(nn.Module):
     linear_z: nn.Linear
     linear_h: nn.Linear
     n_groups: int
-    def __init__(self, input_size: int, hidden_size: int, n_groups: int):
+    def __init__(self, input_size: int, hidden_size: int, n_groups: int, entropy_weight: float = 0.01):
         super(GroupedMinGRU, self).__init__()
         self.linear_z = nn.Linear(input_size, hidden_size)
         self.linear_h = nn.Linear(input_size, hidden_size)
         self.n_groups = n_groups
+        self.entropy_weight = entropy_weight
 
     def forward(self, x: Tensor, h_0: Tensor):
         k: Tensor = self.linear_z(x)
 
-        # Split log_z into n_groups groups, take their norms, softmax them, and then recombine them
-        k = k.view(k.size(0), k.size(1), self.n_groups, k.size(2) // self.n_groups)
-        k_norms = torch.linalg.vector_norm(k, dim=-1, keepdim=True)
-        k_softmaxed = F.softmax(k_norms, dim=2)
-        if random.random() < 0.0001:
-            breakpoint()
-        k = (k / k_norms) * k_softmaxed
-        k = k.view(k.size(0), k.size(1), -1)
-
         log_z = -F.softplus(-k)
         log_coeffs = -F.softplus(k)
+
+        j = log_coeffs
+        # Split log_z into n_groups groups, take their norms, softmax them, and then recombine them
+        j = j.view(j.size(0), j.size(1), self.n_groups, j.size(2) // self.n_groups)
+        j_norms = torch.linalg.vector_norm(j, dim=-1, keepdim=True)
+        j_softmaxed = F.log_softmax(j_norms, dim=2)
+        j_softmaxed_squeezed = j_softmaxed.squeeze(-1)
+        softmax_entropy = -torch.sum(torch.exp(j_softmaxed_squeezed) * j_softmaxed_squeezed, dim=2).mean()
+
+        print(j_norms.mean(axis=(0,1,3)))
+
+        # if random.random() < 0.0001:
+        #     breakpoint()
+        
+        j = (j / j_norms) * j_softmaxed
+        j = j.view(j.size(0), j.size(1), -1)
+
+        log_coeffs = j
+
         log_h_0 = log_g(h_0).unsqueeze(1)
         log_tilde_h = log_g(self.linear_h(x))
         h = parallel_scan_log(
             log_coeffs, torch.cat([log_h_0, log_z + log_tilde_h], dim=1)
         )
-        return h[:, -x.size(1) :, :]
+        return h[:, -x.size(1) :, :], #softmax_entropy * self.entropy_weight
 
 
 class MinLSTM(nn.Module):
@@ -131,15 +142,17 @@ class LanguageModel(nn.Module):
         self.layer_norm = nn.LayerNorm(config.embed_size)
         self.dropout = nn.Dropout(config.dropout)
         for _ in range(config.num_layers):
-            if config.rnn_type == "minlstm":
-                self.rnn_layers.append(MinLSTM(config.embed_size, config.hidden_size))
-            elif config.rnn_type == "mingru":
-                self.rnn_layers.append(MinGRU(config.embed_size, config.hidden_size))
+            # if config.rnn_type == "minlstm":
+            #     self.rnn_layers.append(MinLSTM(config.embed_size, config.hidden_size))
+            # elif config.rnn_type == "mingru":
+            self.rnn_layers.append(GroupedMinGRU(config.embed_size, config.hidden_size, 2, config.entropy_weight))
+            # self.rnn_layers.append(MinGRU(config.embed_size, config.hidden_size))
         self.fc = nn.Linear(config.hidden_size, vocab_size)
 
     def forward(self, x):
         x = self.embedding(x)
         h = torch.zeros(x.size(0), x.size(2)).to(x.device)
+        entropy = 0
         for i, rnn in enumerate(self.rnn_layers):
             # Experiment: After the first layer, use dilated convolutions to increase the receptive field
             # Result: This is far, far too slow
@@ -167,10 +180,11 @@ class LanguageModel(nn.Module):
             #     x = F.avg_pool1d(x.permute(0, 2, 1), kernel_size=2, stride=1, padding=1).permute(0, 2, 1)
             #     # Fold the sequence back
             #     x = self.fold(x.permute(0, 2, 1)).permute(0, 2, 1)
-            x = rnn(x, h)
+            x, layer_entropy = rnn(x, h)
             x = self.layer_norm(x)
             x = self.dropout(x)
-        return self.fc(x)
+            entropy += layer_entropy
+        return self.fc(x), entropy
 
 
 class SinglefileDataset(Dataset):
@@ -259,13 +273,16 @@ class Trainer:
         with autocast(device_type=self.device.type):
             self.model.train()
             total_loss = 0
+            total_entropy  = 0
             progressbar = tqdm(train_loader, desc="Training")
             max_grads_acc = self.config.accumulate_grad_batches
             for i, batch in enumerate(progressbar):
                 x, y = batch
                 x, y = x.to(self.device), y.to(self.device)
-                output = self.model(x)
-                loss = self.criterion(output.view(-1, output.size(-1)), y.reshape(-1))
+                output, entropy = self.model(x)
+                real_loss = self.criterion(output.view(-1, output.size(-1)), y.reshape(-1))
+                loss = real_loss + entropy
+                total_entropy += entropy
                 self.scaler.scale(loss / max_grads_acc).backward()
                 if (i + 1) % max_grads_acc == 0:
                     self.scaler.unscale_(self.optimizer)
@@ -274,8 +291,8 @@ class Trainer:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad()
-                total_loss += loss.item()
-                progressbar.set_postfix({"loss": f"{total_loss / (i+1):.04f}"})
+                total_loss += real_loss.item()
+                progressbar.set_postfix({"real loss": f"{total_loss / (i+1):.04f}", "entropy": f"{total_entropy / (i+1):.04f}"})
 
             self.scheduler.step()
         return total_loss / len(train_loader)
@@ -288,7 +305,7 @@ class Trainer:
                 for batch in tqdm(val_loader, desc="Evaluating"):
                     x, y = batch
                     x, y = x.to(self.device), y.to(self.device)
-                    output = self.model(x)
+                    output, entropy = self.model(x)
                     loss = self.criterion(
                         output.view(-1, output.size(-1)), y.reshape(-1)
                     )
@@ -324,7 +341,7 @@ class Chat:
             )
             tokens = tokens.to(self.device)
             for _ in range(max_length):
-                output = self.model(tokens)
+                output, _entropy = self.model(tokens)
                 next_token = torch.argmax(output[:, -1, :], dim=-1).unsqueeze(1)
                 tokens = torch.cat([tokens, next_token], dim=1)
                 if next_token == tokenizer.eos_token_id:
