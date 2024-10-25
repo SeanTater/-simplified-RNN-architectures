@@ -98,7 +98,7 @@ class GroupedMinGRU(nn.Module):
         h = parallel_scan_log(
             log_coeffs, torch.cat([log_h_0, log_z + log_tilde_h], dim=1)
         )
-        return h[:, -x.size(1) :, :], #softmax_entropy * self.entropy_weight
+        return h[:, -x.size(1) :, :], softmax_entropy * self.entropy_weight
 
 
 class MinLSTM(nn.Module):
