@@ -13,10 +13,25 @@ dependencies = [
     "torch>=2.5.0",
     "tqdm>=4.64.1",
     "transformers>=4.45.2",
+    "markupsafe~=3.0.2"
 ]
 
 [tool.uv.sources]
 torch = { index = "pytorch" }
+# Without this, it also looks for it in the torch repo and it fails
+# I figure that must be a bug but this seems like an effective workaround
+markupsafe = { index = "pypi" }
 
-[tool.uv]
-extra-index-url = ["https://download.pytorch.org/whl/rocm6.2"]
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/rocm6.2"
+# explicit = true
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+# explicit = true
+
+
+# [tool.uv]
+# extra-index-url = ["https://download.pytorch.org/whl/rocm6.2"]

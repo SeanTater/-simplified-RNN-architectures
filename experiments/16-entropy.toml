@@ -7,10 +7,11 @@ hidden_size = 768
 num_layers = 3
 rnn_type = "mingru"
 dropout = 0.25
-entropy_weight = 0.01
+entropy_weight = 1
+num_groups = 8
 
 [train]
-learning_rate = 3e-4
+learning_rate = 5e-5
 epochs = 100
 accumulate_grad_batches = 2
 

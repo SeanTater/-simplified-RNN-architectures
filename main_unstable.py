@@ -75,30 +75,36 @@ class GroupedMinGRU(nn.Module):
         log_z = -F.softplus(-k)
         log_coeffs = -F.softplus(k)
 
-        j = log_coeffs
+        # We want to push the network to activate only one group at a time
+        j = log_z
         # Split log_z into n_groups groups, take their norms, softmax them, and then recombine them
         j = j.view(j.size(0), j.size(1), self.n_groups, j.size(2) // self.n_groups)
-        j_norms = torch.linalg.vector_norm(j, dim=-1, keepdim=True)
-        j_softmaxed = F.log_softmax(j_norms, dim=2)
-        j_softmaxed_squeezed = j_softmaxed.squeeze(-1)
-        softmax_entropy = -torch.sum(torch.exp(j_softmaxed_squeezed) * j_softmaxed_squeezed, dim=2).mean()
+        # This is effectively a geometric mean, but this is just for convenience
+        j_norms = j.mean(dim=3)
+        # j_softmaxed_squeezed = F.log_softmax(j_norms, dim=2).squeeze(-1)
+        # pick_one_activation_loss = -torch.sum(torch.exp(j_softmaxed_squeezed) * j_softmaxed_squeezed, dim=2).mean()
+        pick_one_activation_loss = -j_norms.var(dim=2).mean()
 
-        print(j_norms.mean(axis=(0,1,3)))
+        # But we also want to push it to activate all groups about equally frequently
+        spread_activations_loss = j_norms.mean(dim=(0,1)).var()
+
+
+        #print(j_norms.mean(axis=(0,1,3)))
 
         # if random.random() < 0.0001:
         #     breakpoint()
         
-        j = (j / j_norms) * j_softmaxed
-        j = j.view(j.size(0), j.size(1), -1)
+        # j = (j / j_norms) * j_softmaxed
+        # j = j.view(j.size(0), j.size(1), -1)
 
-        log_coeffs = j
+        # log_z = j
 
         log_h_0 = log_g(h_0).unsqueeze(1)
         log_tilde_h = log_g(self.linear_h(x))
         h = parallel_scan_log(
             log_coeffs, torch.cat([log_h_0, log_z + log_tilde_h], dim=1)
         )
-        return h[:, -x.size(1) :, :], softmax_entropy * self.entropy_weight
+        return h[:, -x.size(1) :, :], self.entropy_weight * (pick_one_activation_loss + spread_activations_loss)
 
 
 class MinLSTM(nn.Module):
@@ -145,8 +151,8 @@ class LanguageModel(nn.Module):
             # if config.rnn_type == "minlstm":
             #     self.rnn_layers.append(MinLSTM(config.embed_size, config.hidden_size))
             # elif config.rnn_type == "mingru":
-            self.rnn_layers.append(GroupedMinGRU(config.embed_size, config.hidden_size, 2, config.entropy_weight))
-            # self.rnn_layers.append(MinGRU(config.embed_size, config.hidden_size))
+            # self.rnn_layers.append(GroupedMinGRU(config.embed_size, config.hidden_size, config.num_groups, config.entropy_weight))
+            self.rnn_layers.append(MinGRU(config.embed_size, config.hidden_size))
         self.fc = nn.Linear(config.hidden_size, vocab_size)
 
     def forward(self, x):
@@ -193,7 +199,7 @@ class SinglefileDataset(Dataset):
 
     def __init__(self, config: DatasetConfig):
         self.config = config
-        self.frame = pl.read_parquet(config.file_path)[:1000]
+        self.frame = pl.read_parquet(config.file_path)
         tokens = pl.Series([], dtype=pl.List(pl.UInt16))
         for slc in tqdm(self.frame.iter_slices(100), desc="Tokenizing training data..", total=(self.frame.height + 99) // 100):
             slice_tokens = [ self.encode_one_doc(doc) for doc in slc["markdown"] ]
@@ -254,7 +260,7 @@ class Trainer:
 
     def __init__(self, config: TrainConfig, model: LanguageModel):
         self.model = model.to(self.device)
-        self.model.compile()
+        # self.model.compile()
         self.optimizer = optim.AdamW(
             model.parameters(), lr=config.learning_rate, fused=True
         )
@@ -282,7 +288,7 @@ class Trainer:
                 output, entropy = self.model(x)
                 real_loss = self.criterion(output.view(-1, output.size(-1)), y.reshape(-1))
                 loss = real_loss + entropy
-                total_entropy += entropy
+                total_entropy += entropy.item()
                 self.scaler.scale(loss / max_grads_acc).backward()
                 if (i + 1) % max_grads_acc == 0:
                     self.scaler.unscale_(self.optimizer)

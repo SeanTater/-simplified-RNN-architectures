@@ -240,7 +240,7 @@ class Trainer:
 
     def __init__(self, config: TrainConfig, model: LanguageModel):
         self.model = model.to(self.device)
-        self.model.compile()
+        #self.model.compile()
         self.optimizer = optim.AdamW(
             model.parameters(), lr=config.learning_rate, fused=True
         )
@@ -381,9 +381,9 @@ def main():
             trainer.save_model(last_model_path)
             bot = Chat(model)
             # Print some examples of the bot's responses
-            print(f"Lizards are {bot.chat('lizards are', max_length=10)}")
-            print(f"Python is {bot.chat('python is', max_length=10)}")
-            print(f"Hello, {bot.chat('hello', max_length=10)}")
+            print(bot.chat('lizards are', max_length=10))
+            print(bot.chat('python is', max_length=10))
+            print(bot.chat('hello', max_length=10))
 
     print("Training completed.")
     if last_model_path is not None:
