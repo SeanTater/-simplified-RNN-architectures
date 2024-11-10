@@ -1,0 +1,21 @@
+[experiment]
+name = "17-from-14-reduce-embed-dim"
+
+[model]
+embed_size = 384
+hidden_size = 384
+num_layers = 3
+rnn_type = "mingru"
+dropout = 0.25
+
+[train]
+learning_rate = 1e-4
+epochs = 100
+accumulate_grad_batches = 2
+
+[dataset]
+file_path = "data/09_04_2023_v1.parquet"
+byte_snippet_length = 2048
+seq_length = 32
+batch_size = 64
+cut_to = 1048576

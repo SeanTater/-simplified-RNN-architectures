@@ -1,0 +1,21 @@
+[experiment]
+name = "18--from-17-stack-higher"
+
+[model]
+embed_size = 1024
+hidden_size = 1024
+num_layers = 12
+rnn_type = "mingru"
+dropout = 0.25
+
+[train]
+learning_rate = 6e-5
+epochs = 100
+accumulate_grad_batches = 2
+
+[dataset]
+file_path = "data/09_04_2023_v1.parquet"
+byte_snippet_length = 2048
+seq_length = 32
+batch_size = 64
+cut_to = 1048576
