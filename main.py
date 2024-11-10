@@ -58,38 +58,6 @@ class MinGRU(nn.Module):
         )
         return h[:, -x.size(1) :, :]
 
-class GroupedMinGRU(nn.Module):
-    linear_z: nn.Linear
-    linear_h: nn.Linear
-    n_groups: int
-    def __init__(self, input_size: int, hidden_size: int, n_groups: int):
-        super(GroupedMinGRU, self).__init__()
-        self.linear_z = nn.Linear(input_size, hidden_size)
-        self.linear_h = nn.Linear(input_size, hidden_size)
-        self.n_groups = n_groups
-
-    def forward(self, x: Tensor, h_0: Tensor):
-        k: Tensor = self.linear_z(x)
-
-        # Split log_z into n_groups groups, take their norms, softmax them, and then recombine them
-        k = k.view(k.size(0), k.size(1), self.n_groups, k.size(2) // self.n_groups)
-        k_norms = torch.linalg.vector_norm(k, dim=-1, keepdim=True)
-        k_softmaxed = F.softmax(k_norms, dim=2)
-        if random.random() < 0.0001:
-            breakpoint()
-        k = (k / k_norms) * k_softmaxed
-        k = k.view(k.size(0), k.size(1), -1)
-
-        log_z = -F.softplus(-k)
-        log_coeffs = -F.softplus(k)
-        log_h_0 = log_g(h_0).unsqueeze(1)
-        log_tilde_h = log_g(self.linear_h(x))
-        h = parallel_scan_log(
-            log_coeffs, torch.cat([log_h_0, log_z + log_tilde_h], dim=1)
-        )
-        return h[:, -x.size(1) :, :]
-
-
 class MinLSTM(nn.Module):
     linear_f: nn.Linear
     linear_i: nn.Linear
@@ -131,10 +99,11 @@ class LanguageModel(nn.Module):
         self.layer_norm = nn.LayerNorm(config.embed_size)
         self.dropout = nn.Dropout(config.dropout)
         for _ in range(config.num_layers):
-            if config.rnn_type == "minlstm":
-                self.rnn_layers.append(MinLSTM(config.embed_size, config.hidden_size))
-            elif config.rnn_type == "mingru":
-                self.rnn_layers.append(MinGRU(config.embed_size, config.hidden_size))
+            # if config.rnn_type == "minlstm":
+            #     self.rnn_layers.append(MinLSTM(config.embed_size, config.hidden_size))
+            # elif config.rnn_type == "mingru":
+            # self.rnn_layers.append(GroupedMinGRU(config.embed_size, config.hidden_size, config.num_groups, config.entropy_weight))
+            self.rnn_layers.append(MinGRU(config.embed_size, config.hidden_size))
         self.fc = nn.Linear(config.hidden_size, vocab_size)
 
     def forward(self, x):
@@ -179,7 +148,7 @@ class SinglefileDataset(Dataset):
 
     def __init__(self, config: DatasetConfig):
         self.config = config
-        self.frame = pl.read_parquet(config.file_path)[:1000]
+        self.frame = pl.read_parquet(config.file_path)
         tokens = pl.Series([], dtype=pl.List(pl.UInt16))
         for slc in tqdm(self.frame.iter_slices(100), desc="Tokenizing training data..", total=(self.frame.height + 99) // 100):
             slice_tokens = [ self.encode_one_doc(doc) for doc in slc["markdown"] ]
@@ -240,7 +209,7 @@ class Trainer:
 
     def __init__(self, config: TrainConfig, model: LanguageModel):
         self.model = model.to(self.device)
-        #self.model.compile()
+        self.model.compile()
         self.optimizer = optim.AdamW(
             model.parameters(), lr=config.learning_rate, fused=True
         )
@@ -275,7 +244,6 @@ class Trainer:
                     self.scaler.update()
                     self.optimizer.zero_grad()
                 total_loss += loss.item()
-                progressbar.set_postfix({"loss": f"{total_loss / (i+1):.04f}"})
 
             self.scheduler.step()
         return total_loss / len(train_loader)
@@ -367,7 +335,10 @@ def main():
         train_loss = trainer.train(train_loader)
         val_loss = trainer.evaluate(val_loader)
         print(
-            f"Epoch {epoch+1}/{config.train.epochs}, Train Loss: {train_loss:.04f}, Val Loss: {val_loss:.04f}, LR: {trainer.scheduler.get_last_lr()[0]:.06f}"
+            f"Epoch {epoch+1}/{config.train.epochs},"
+            f" Train Loss: {train_loss:.04f},"
+            f" Val Loss: {val_loss:.04f},"
+            f" LR: {trainer.scheduler.get_last_lr()[0]:.06f}"
         )
 
         if val_loss < best_val_loss:
