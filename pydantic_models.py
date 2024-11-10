@@ -21,7 +21,9 @@ class ModelConfig(BaseModel):
     dropout: float = Field(0.25, description="Dropout rate for the model")
     dilation: int = Field(2, description="Dilation factor for the model")
     entropy_weight: float = Field(0.1, description="Weight for the entropy loss")
-    num_groups: int = Field(2, description="Number of groups used inside embedding vectors for the model")
+    num_groups: int = Field(
+        2, description="Number of groups used inside embedding vectors for the model"
+    )
 
 
 class TrainConfig(BaseModel):
