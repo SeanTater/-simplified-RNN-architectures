@@ -1,8 +1,9 @@
-from pydantic import Field, FilePath, BaseModel
 from datetime import datetime
-from typing import Literal
-import tomllib
 from pathlib import Path
+from typing import Literal
+
+import tomllib
+from pydantic import BaseModel, Field, FilePath
 
 
 class ExperimentConfig(BaseModel):
@@ -32,6 +33,7 @@ class TrainConfig(BaseModel):
     accumulate_grad_batches: int = Field(
         1, description="Number of batches to accumulate gradients over"
     )
+    device: str = Field("cpu", description="Torch device to run model on")
 
 
 class DatasetConfig(BaseModel):
@@ -42,6 +44,9 @@ class DatasetConfig(BaseModel):
         2048, description="Length of byte snippets to read from the file"
     )
     cut_to: int = Field(1000, description="Cut the dataset to this many byte snippets")
+    max_chunks: int = Field(
+        25, description="Only tokenize this many batches of 100 articles"
+    )
 
 
 class Config(BaseModel):

@@ -1,24 +1,42 @@
+import torch
+from torch import nn, optim
+from torch.amp import autocast
+from torch.optim.lr_scheduler import LambdaLR
+from tqdm import tqdm
+
 from .lm import LanguageModel
 from .pydantic_models import TrainConfig
-from torch import optim, nn
-
-from torch.optim.lr_scheduler import LambdaLR
-import torch
 from .tokenizer import tokenizer
-
-from torch.amp import autocast
-from tqdm import tqdm
 
 
 class Trainer:
+    """
+    A class to handle the training and evaluation of a language model.
+
+    Attributes:
+        model (LanguageModel): The language model to train.
+        config (TrainConfig): Configuration settings for training.
+        optimizer (optim.Optimizer): Optimizer used for training the model.
+        scaler (torch.GradScaler): Gradient scaler for mixed precision training.
+        scheduler (LambdaLR): Learning rate scheduler.
+    """
+
     model: LanguageModel
     config: TrainConfig
     optimizer: optim.Optimizer
     scaler: torch.GradScaler = torch.GradScaler()
     scheduler: LambdaLR
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device
 
     def __init__(self, config: TrainConfig, model: LanguageModel):
+        """
+        Initializes the Trainer class.
+
+        Args:
+            config (TrainConfig): Configuration settings for training.
+            model (LanguageModel): The language model to be trained.
+        """
+        self.device = torch.device(config.device)
         self.model = model.to(self.device)
         self.model.compile()
         self.optimizer = optim.AdamW(
@@ -36,6 +54,15 @@ class Trainer:
         self.scheduler = LambdaLR(self.optimizer, lr_lambda=lambda epoch: rates[epoch])
 
     def train(self, train_loader):
+        """
+        Trains the model for one epoch.
+
+        Args:
+            train_loader (DataLoader): DataLoader object containing training data.
+
+        Returns:
+            float: Average loss over the entire training dataset.
+        """
         with autocast(device_type=self.device.type):
             self.model.train()
             total_loss = 0
@@ -62,6 +89,15 @@ class Trainer:
         return total_loss / len(train_loader)
 
     def evaluate(self, val_loader):
+        """
+        Evaluates the model on a validation dataset.
+
+        Args:
+            val_loader (DataLoader): DataLoader object containing validation data.
+
+        Returns:
+            float: Average loss over the entire validation dataset.
+        """
         with autocast(device_type=self.device.type):
             self.model.eval()
             total_loss = 0
@@ -77,4 +113,10 @@ class Trainer:
         return total_loss / len(val_loader)
 
     def save_model(self, path):
+        """
+        Saves the model's state dictionary to a specified file.
+
+        Args:
+            path (str): File path where the model will be saved.
+        """
         torch.save(self.model.state_dict(), path)

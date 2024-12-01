@@ -1,7 +1,8 @@
-from torch import nn, Tensor
-import torch.nn.functional as F
-from .min_ops import log_g, parallel_scan_log
 import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+from .min_ops import log_g, parallel_scan_log
 
 
 class MinLSTM(nn.Module):
